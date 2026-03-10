@@ -17,8 +17,8 @@ from rich import box
 console = Console()
 
 client = OpenAI(
-    api_key=os.environ["INCEPTION_API_KEY"],
-    base_url="https://api.inceptionlabs.ai/v1"
+    api_key="ollama",
+    base_url="http://192.168.0.110:11434/v1"
 )
 
 TOOLS = [
@@ -142,11 +142,10 @@ def main():
             transient=True,
         ):
             response = client.chat.completions.create(
-                model="mercury-2",
+                model="qwen3.5:35b",
                 messages=messages,
                 tools=TOOLS,
                 max_tokens=8192,
-                extra_body={"reasoning_effort": "high"}
             )
 
         message = response.choices[0].message
