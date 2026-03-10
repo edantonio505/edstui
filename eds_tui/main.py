@@ -204,6 +204,8 @@ def main():
 
     console.print()
 
+    console.print(f"[dim]  Connecting to: {_base_url}[/dim]\n")
+
     # Try tools API first, fall back to text parsing if not supported
     try:
         messages = [
@@ -213,7 +215,8 @@ def main():
         run_with_tools(messages)
     except APIStatusError as e:
         if e.status_code == 405:
-            console.print("[dim]  Tools API not supported, switching to fallback mode...[/dim]\n")
+            console.print(f"[dim]  Tools API not supported (405), switching to fallback mode...[/dim]")
+            console.print(f"[dim]  Response body: {e.response.text}[/dim]\n")
             messages = [
                 {"role": "system", "content": build_system_prompt(fallback=True)},
                 {"role": "user", "content": user_input}
@@ -229,3 +232,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("\n[dim]Cancelled.[/dim]")
         sys.exit(0)
+    except APIStatusError as e:
+        console.print(f"\n[red]API error {e.status_code}[/red]")
+        console.print(f"[dim]URL: {_base_url}[/dim]")
+        console.print(f"[dim]Body: {e.response.text}[/dim]")
+        sys.exit(1)
