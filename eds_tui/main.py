@@ -2,10 +2,9 @@
 import os
 import sys
 import json
+import re
 import subprocess
-import threading
-import time
-from openai import OpenAI
+from openai import OpenAI, APIStatusError
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -47,12 +46,11 @@ TOOLS = [
 ]
 
 
-def build_system_prompt() -> str:
-    return (
+def build_system_prompt(fallback: bool = False) -> str:
+    base = (
         f"You are a helpful terminal assistant running on Ubuntu Linux. "
         f"The user's current working directory is: {os.getcwd()}. "
         f"All commands run relative to this directory unless a full path is needed. "
-        f"You have access to the user's terminal via the run_command tool. "
         f"Search strategy: "
         f"- Use 'find' to locate files or directories by name. "
         f"- Use 'grep -r' to search inside file contents when looking for text, keywords, or strings. "
@@ -61,6 +59,16 @@ def build_system_prompt() -> str:
         f"Think step by step before acting. Plan the right command for the task. "
         f"Be direct and concise in your final answer."
     )
+    if fallback:
+        base += (
+            f" When you need to run a shell command, output it in a bash code block like:\n"
+            f"```bash\nyour command here\n```\n"
+            f"After each command block, wait for the output before continuing. "
+            f"When you have the final answer, output it normally without a code block."
+        )
+    else:
+        base += f" You have access to the user's terminal via the run_command tool."
+    return base
 
 
 def run_command(command: str) -> str:
@@ -92,15 +100,82 @@ def run_command(command: str) -> str:
         return f"Error: {e}"
 
 
+def call_model(messages, use_tools: bool):
+    kwargs = dict(model="qwen3.5:35b", messages=messages, max_tokens=8192)
+    if use_tools:
+        kwargs["tools"] = TOOLS
+    return client.chat.completions.create(**kwargs)
+
+
+def run_with_tools(messages):
+    """Agentic loop using the tools API."""
+    while True:
+        with Live(Spinner("dots2", text=Text("  Thinking...", style="dim italic")),
+                  console=console, refresh_per_second=12, transient=True):
+            response = call_model(messages, use_tools=True)
+
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in message.tool_calls
+                ]
+            })
+            console.print(Text("  Running tools", style="bold bright_black"))
+            console.print()
+            for tc in message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                output = run_command(args["command"])
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+        else:
+            console.print(Panel(Markdown(message.content), border_style="cyan",
+                                padding=(1, 2), box=box.ROUNDED))
+            console.print()
+            break
+
+
+def run_fallback(messages):
+    """Fallback: parse ```bash blocks from text and execute them manually."""
+    while True:
+        with Live(Spinner("dots2", text=Text("  Thinking...", style="dim italic")),
+                  console=console, refresh_per_second=12, transient=True):
+            response = call_model(messages, use_tools=False)
+
+        content = response.choices[0].message.content
+
+        # Extract all ```bash ... ``` blocks
+        commands = re.findall(r"```bash\s*\n(.*?)```", content, re.DOTALL)
+
+        if commands:
+            console.print(Text("  Running tools", style="bold bright_black"))
+            console.print()
+            messages.append({"role": "assistant", "content": content})
+            results = []
+            for cmd in commands:
+                cmd = cmd.strip()
+                output = run_command(cmd)
+                results.append(f"$ {cmd}\n{output}")
+            messages.append({"role": "user", "content": "Command output:\n" + "\n\n".join(results)})
+        else:
+            console.print(Panel(Markdown(content), border_style="cyan",
+                                padding=(1, 2), box=box.ROUNDED))
+            console.print()
+            break
+
+
 def print_header():
-    cwd = os.getcwd()
     title = Text()
     title.append("eds", style="bold bright_white")
     title.append(" tui", style="bold cyan")
     console.print()
     console.print(Panel(
         title,
-        subtitle=f"[dim]{cwd}[/dim]",
+        subtitle=f"[dim]{os.getcwd()}[/dim]",
         border_style="bright_black",
         padding=(0, 2),
         box=box.ROUNDED,
@@ -111,7 +186,6 @@ def print_header():
 def main():
     print_header()
 
-    # Prompt input line styled like a shell prompt
     cwd_short = os.path.basename(os.getcwd()) or os.getcwd()
     prompt_text = Text()
     prompt_text.append(f" {cwd_short}", style="bold cyan")
@@ -130,67 +204,23 @@ def main():
 
     console.print()
 
-    messages = [
-        {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": user_input}
-    ]
-
-    # Agentic loop
-    while True:
-        with Live(
-            Spinner("dots2", text=Text("  Thinking...", style="dim italic")),
-            console=console,
-            refresh_per_second=12,
-            transient=True,
-        ):
-            response = client.chat.completions.create(
-                model="qwen3.5:35b",
-                messages=messages,
-                tools=TOOLS,
-                max_tokens=8192,
-            )
-
-        message = response.choices[0].message
-
-        if message.tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in message.tool_calls
-                ]
-            })
-
-            # Print a "Running tools" label once before executing
-            console.print(Text("  Running tools", style="bold bright_black"))
-            console.print()
-
-            for tc in message.tool_calls:
-                args = json.loads(tc.function.arguments)
-                output = run_command(args["command"])
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": output
-                })
+    # Try tools API first, fall back to text parsing if not supported
+    try:
+        messages = [
+            {"role": "system", "content": build_system_prompt(fallback=False)},
+            {"role": "user", "content": user_input}
+        ]
+        run_with_tools(messages)
+    except APIStatusError as e:
+        if e.status_code == 405:
+            console.print("[dim]  Tools API not supported, switching to fallback mode...[/dim]\n")
+            messages = [
+                {"role": "system", "content": build_system_prompt(fallback=True)},
+                {"role": "user", "content": user_input}
+            ]
+            run_fallback(messages)
         else:
-            # Final answer rendered as markdown in a panel
-            console.print(Panel(
-                Markdown(message.content),
-                border_style="cyan",
-                padding=(1, 2),
-                box=box.ROUNDED,
-            ))
-            console.print()
-            break
+            raise
 
 
 if __name__ == "__main__":
