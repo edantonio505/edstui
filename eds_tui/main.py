@@ -16,9 +16,11 @@ from rich import box
 
 console = Console()
 
+_base_url = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434") + "/v1"
+
 client = OpenAI(
     api_key="ollama",
-    base_url="http://192.168.0.110:11434/v1"
+    base_url=_base_url
 )
 
 TOOLS = [
