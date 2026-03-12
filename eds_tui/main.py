@@ -14,9 +14,11 @@ from rich import box
 console = Console()
 
 _host = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434")
+_token = os.environ.get("EDS_TUI_TOKEN", "")
 _model = "qwen3.5:35b"
 
-client = ollama.Client(host=_host)
+_headers = {"Authorization": f"Bearer {_token}"} if _token else {}
+client = ollama.Client(host=_host, headers=_headers)
 
 TOOLS = [
     {
