@@ -13,12 +13,14 @@ from rich import box
 
 console = Console()
 
-_host = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434")
-_token = os.environ.get("EDS_TUI_TOKEN", "")
 _model = "qwen3.5:35b"
 
-_headers = {"Authorization": f"Bearer {_token}"} if _token else {}
-client = ollama.Client(host=_host, headers=_headers)
+
+def make_client():
+    host = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434").rstrip("/")
+    token = os.environ.get("EDS_TUI_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return ollama.Client(host=host, headers=headers)
 
 TOOLS = [
     {
@@ -105,6 +107,8 @@ def print_header():
 
 
 def main():
+    client = make_client()
+
     print_header()
 
     cwd_short = os.path.basename(os.getcwd()) or os.getcwd()
