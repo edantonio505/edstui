@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "eds-tui"
 version = "1.0.0"
-description = "Ed's terminal AI assistant powered by Mercury"
+description = "Ed's terminal AI assistant your LLM"
 requires-python = ">=3.9"
 dependencies = [
     "ollama",
