@@ -20,7 +20,7 @@ def make_client():
     host = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434").rstrip("/")
     token = os.environ.get("EDS_TUI_TOKEN", "")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    return ollama.Client(host=host, headers=headers)
+    return ollama.Client(host=host, headers=headers, timeout=None)
 
 TOOLS = [
     {
