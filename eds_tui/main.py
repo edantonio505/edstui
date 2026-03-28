@@ -14,6 +14,7 @@ from rich import box
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.keys import Keys
 
 console = Console()
 
@@ -142,7 +143,7 @@ def main():
 
     kb = KeyBindings()
 
-    @kb.add("bracketed-paste")
+    @kb.add(Keys.BracketedPaste)
     def handle_paste(event):
         text = event.data
         lines = [l for l in text.splitlines() if l.strip()]
