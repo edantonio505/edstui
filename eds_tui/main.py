@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import re
 import subprocess
 import ollama
 from rich.console import Console
@@ -10,6 +11,9 @@ from rich.text import Text
 from rich.live import Live
 from rich.spinner import Spinner
 from rich import box
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.formatted_text import ANSI
 
 console = Console()
 
@@ -112,16 +116,33 @@ def main():
     print_header()
 
     cwd_short = os.path.basename(os.getcwd()) or os.getcwd()
-    prompt_text = Text()
-    prompt_text.append(f" {cwd_short}", style="bold cyan")
-    prompt_text.append(" ❯ ", style="bold bright_white")
-    console.print(prompt_text, end="")
+
+    pasted_blocks = []
+
+    kb = KeyBindings()
+
+    @kb.add("bracketed-paste")
+    def handle_paste(event):
+        text = event.data
+        lines = [l for l in text.splitlines() if l.strip()]
+        if len(lines) > 1:
+            pasted_blocks.append(text)
+            event.current_buffer.insert_text(f"[+{len(lines)} lines]")
+        else:
+            event.current_buffer.insert_text(text.strip())
+
+    session = PromptSession(key_bindings=kb)
+    prompt = ANSI(f"\033[1;36m {cwd_short}\033[0m\033[1;97m ❯ \033[0m")
 
     try:
-        user_input = input().strip()
+        raw = session.prompt(prompt)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]Cancelled.[/dim]")
         sys.exit(0)
+
+    # Reconstruct: replace [+N lines] placeholders with actual pasted content
+    paste_iter = iter(pasted_blocks)
+    user_input = re.sub(r"\[\+\d+ lines\]", lambda _: next(paste_iter), raw).strip()
 
     if not user_input:
         console.print("[dim]No input. Exiting.[/dim]")
