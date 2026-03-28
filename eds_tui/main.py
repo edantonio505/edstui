@@ -2,6 +2,7 @@
 import os
 import sys
 import re
+import json
 import subprocess
 import ollama
 from rich.console import Console
@@ -111,6 +112,41 @@ def print_header():
     console.print()
 
 
+HISTORY_FILE = os.path.expanduser("~/.eds_tui_history.json")
+
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_history(messages):
+    # Save only user/assistant/tool messages, not system prompt
+    saveable = [m for m in messages if (m if isinstance(m, dict) else vars(m)).get("role") != "system"]
+    # Normalize ollama message objects to dicts
+    normalized = []
+    for m in saveable:
+        if isinstance(m, dict):
+            normalized.append(m)
+        else:
+            d = {"role": m.role, "content": m.content or ""}
+            if getattr(m, "tool_calls", None):
+                d["tool_calls"] = [
+                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in m.tool_calls
+                ]
+            normalized.append(d)
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(normalized, f)
+
+
+def clear_history():
+    if os.path.exists(HISTORY_FILE):
+        os.remove(HISTORY_FILE)
+
+
 def self_upgrade():
     console.print("\n[dim]  Upgrading eds-tui from GitHub...[/dim]\n")
     result = subprocess.run(
@@ -133,14 +169,25 @@ def main():
     if "--upgrade" in sys.argv:
         self_upgrade()
 
+    is_continue = "--continue" in sys.argv
     client = make_client()
 
     print_header()
 
     cwd_short = os.path.basename(os.getcwd()) or os.getcwd()
 
-    pasted_blocks = []
+    # Load or start history
+    if is_continue:
+        prior = load_history()
+        if prior:
+            console.print(f"[dim]  Continuing conversation ({len([m for m in prior if m.get('role') == 'user'])} previous messages)[/dim]\n")
+        else:
+            console.print("[dim]  No previous conversation found, starting fresh.[/dim]\n")
+    else:
+        clear_history()
+        prior = []
 
+    pasted_blocks = []
     kb = KeyBindings()
 
     @kb.add(Keys.BracketedPaste)
@@ -162,7 +209,6 @@ def main():
         console.print("\n[dim]Cancelled.[/dim]")
         sys.exit(0)
 
-    # Reconstruct: replace [+N lines] placeholders with actual pasted content
     paste_iter = iter(pasted_blocks)
     user_input = re.sub(r"\[\+\d+ lines\]", lambda _: next(paste_iter), raw).strip()
 
@@ -172,10 +218,9 @@ def main():
 
     console.print()
 
-    messages = [
-        {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": user_input}
-    ]
+    messages = [{"role": "system", "content": build_system_prompt()}]
+    messages += prior
+    messages.append({"role": "user", "content": user_input})
 
     # Agentic loop
     while True:
@@ -201,6 +246,7 @@ def main():
                 box=box.ROUNDED,
             ))
             console.print()
+            save_history(messages)
             break
 
 
