@@ -5,3 +5,10 @@ dist/
 *.egg-info/
 __pycache__/
 *.pyc
+ask
+ask.py
+test_mercury.py
+DOCUMENTATION.md
+prompt_for_script.txt
+eds_tui/TODO.md
+index.html*
