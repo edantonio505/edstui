@@ -110,7 +110,28 @@ def print_header():
     console.print()
 
 
+def self_upgrade():
+    console.print("\n[dim]  Upgrading eds-tui from GitHub...[/dim]\n")
+    result = subprocess.run(
+        ["pipx", "install", "git+https://github.com/edantonio505/edstui.git", "--force"],
+        text=True
+    )
+    if result.returncode == 0:
+        console.print("[green]  Done. Restart ask to use the new version.[/green]\n")
+    else:
+        console.print("[red]  pipx failed, trying pip...[/red]\n")
+        subprocess.run([
+            sys.executable, "-m", "pip", "install",
+            "git+https://github.com/edantonio505/edstui.git",
+            "--upgrade", "--break-system-packages"
+        ])
+    sys.exit(0)
+
+
 def main():
+    if "--upgrade" in sys.argv:
+        self_upgrade()
+
     client = make_client()
 
     print_header()
