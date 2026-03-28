@@ -123,24 +123,23 @@ def load_history():
 
 
 def save_history(messages):
+    # Save only user/assistant/tool messages, not system prompt
+    saveable = [m for m in messages if (m if isinstance(m, dict) else vars(m)).get("role") != "system"]
+    # Normalize ollama message objects to dicts
     normalized = []
-    for m in messages:
-        # Get role regardless of whether it's a dict or Pydantic object
-        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-        if role == "system":
-            continue
+    for m in saveable:
         if isinstance(m, dict):
             normalized.append(m)
         else:
-            # Pydantic model — use model_dump() if available, else build manually
-            if hasattr(m, "model_dump"):
-                d = m.model_dump(exclude_none=True)
-                d["content"] = d.get("content") or ""
-            else:
-                d = {"role": m.role, "content": m.content or ""}
+            d = {"role": m.role, "content": m.content or ""}
+            if getattr(m, "tool_calls", None):
+                d["tool_calls"] = [
+                    {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in m.tool_calls
+                ]
             normalized.append(d)
     with open(HISTORY_FILE, "w") as f:
-        json.dump(normalized, f, default=str)
+        json.dump(normalized, f)
 
 
 def clear_history():
@@ -181,12 +180,7 @@ def main():
     if is_continue:
         prior = load_history()
         if prior:
-            user_turns = [m for m in prior if m.get("role") == "user"]
-            console.print(f"[dim]  Continuing conversation — {len(user_turns)} previous question(s) in history[/dim]")
-            for m in user_turns:
-                snippet = m.get("content", "")[:60].replace("\n", " ")
-                console.print(f"[dim]    · {snippet}...[/dim]")
-            console.print()
+            console.print(f"[dim]  Continuing conversation ({len([m for m in prior if m.get('role') == 'user'])} previous messages)[/dim]\n")
         else:
             console.print("[dim]  No previous conversation found, starting fresh.[/dim]\n")
     else:
