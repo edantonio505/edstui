@@ -87,13 +87,21 @@ def run_command(command: str) -> str:
         if result.stderr:
             output += result.stderr
         output = output.strip() or "(no output)"
-        console.print(f"[dim]{output}[/dim]\n")
+        # Use Text to avoid Rich markup interpretation
+        output_text = Text(output, style="dim")
+        console.print(output_text)
+        console.print()
         return output
     except subprocess.TimeoutExpired:
         console.print("[red]  Error: command timed out after 30 seconds[/red]\n")
         return "Error: command timed out after 30 seconds"
     except Exception as e:
-        console.print(f"[red]  Error: {e}[/red]\n")
+        # Use Text to avoid Rich markup interpretation in error messages
+        error_text = Text()
+        error_text.append("  Error: ", style="red")
+        error_text.append(str(e), style="red")
+        console.print(error_text)
+        console.print()
         return f"Error: {e}"
 
 
