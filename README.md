@@ -1,5 +1,6 @@
 # eds tui
 
+Natural Language Command Executor
 A one-shot terminal AI assistant powered by a local Ollama model.
 
 ## Install
