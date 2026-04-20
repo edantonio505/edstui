@@ -157,8 +157,9 @@ def clear_history():
 
 def self_upgrade():
     console.print("\n[dim]  Upgrading eds-tui from GitHub...[/dim]\n")
+    subprocess.run(["pipx", "uninstall", "eds-tui"], text=True, capture_output=True)
     result = subprocess.run(
-        ["pipx", "install", "git+https://github.com/edantonio505/edstui.git", "--force"],
+        ["pipx", "install", "git+https://github.com/edantonio505/edstui.git"],
         text=True
     )
     if result.returncode == 0:
