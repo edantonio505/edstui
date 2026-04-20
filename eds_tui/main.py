@@ -19,7 +19,7 @@ from prompt_toolkit.keys import Keys
 
 console = Console()
 
-_model = "qwen3.5:35b"
+_model = "ollama/qwen3.6:35b-a3b-q8_0"
 
 
 def make_client():
