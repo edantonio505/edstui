@@ -50,6 +50,16 @@ request error — the conversation is handed to the main model and continues fro
 misconfigured small model degrades to the previous single-model behavior instead of
 breaking.
 
+## Self-location
+
+Commands run in your current working directory, as before. But `ask` also knows where its
+own installed source lives (`eds_tui/main.py` inside the pipx venv), and the system prompt
+points at it: questions about `ask` itself — its flags, options, behavior — are answered by
+reading that file, not by guessing from whatever is in the working directory.
+
+Without this, asking `ask` about its own flags from inside a project containing an unrelated
+`ask.py` sent it searching the wrong program until it hit the tool-call limit.
+
 ## Delegation
 
 When the main model is driving a request, it also gets a `delegate_task` tool and can spawn
