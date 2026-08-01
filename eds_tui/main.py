@@ -26,6 +26,12 @@ _small_model = os.environ.get("EDS_TUI_SMALL_MODEL", "ornith:35b")
 SMALL_MAX_TURNS = 6    # tool-call rounds before escalating off the small model
 HARD_MAX_TURNS = 14    # absolute ceiling, prevents a runaway loop
 
+# Where this running copy of eds tui actually lives, regardless of the user's cwd.
+# Questions about ask itself must be answered from here, not from whatever happens
+# to be in the working directory.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_ENTRY = os.path.join(APP_DIR, "main.py")
+
 
 def make_client():
     host = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434").rstrip("/")
@@ -92,9 +98,15 @@ def tools_for(model: str):
 
 def build_system_prompt() -> str:
     return (
-        f"You are a helpful terminal assistant running on Ubuntu Linux. "
+        f"You are 'eds tui', a helpful terminal assistant invoked as 'ask', running on "
+        f"Ubuntu Linux. "
         f"The user's current working directory is: {os.getcwd()}. "
         f"All commands run relative to this directory unless a full path is needed. "
+        f"Your own source code is at {APP_ENTRY} — that is the copy currently running. "
+        f"When the user asks about you (your flags, options, features, or behavior), read "
+        f"that file and answer from it. Do not infer your own behavior from files in the "
+        f"working directory: they may be unrelated programs, or stale copies that are not "
+        f"what is running. "
         f"You have access to the user's terminal via the run_command tool. "
         f"Search strategy: "
         f"- Use 'find' to locate files or directories by name. "
@@ -197,8 +209,11 @@ SUB_INDENT = "     "
 
 def build_subagent_prompt() -> str:
     return (
-        f"You are a focused helper for a terminal assistant, running on Ubuntu Linux. "
+        f"You are a focused helper for 'eds tui', a terminal assistant invoked as 'ask', "
+        f"running on Ubuntu Linux. "
         f"The current working directory is: {os.getcwd()}. "
+        f"The assistant's own source code is at {APP_ENTRY} — read it if the subtask is "
+        f"about how 'ask' itself behaves, rather than guessing from the working directory. "
         f"You have been handed one specific subtask. Use the run_command tool to complete it, "
         f"then report what you found plainly and concisely. "
         f"You are working autonomously — nobody can answer questions, so do not ask any. "
