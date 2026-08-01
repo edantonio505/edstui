@@ -30,6 +30,7 @@ ask                  # start a fresh conversation (clears history)
 ask --continue       # continue the previous conversation
 ask --fast           # force the small model for this request
 ask --smart          # force the main model for this request
+ask --test           # self-check: prove routing, delegation and escalation work
 ask --upgrade        # update to the latest version from GitHub
 ```
 
@@ -48,6 +49,54 @@ request error — the conversation is handed to the main model and continues fro
 (`↑ escalating to ...`). Triage failures fall back to the main model, so a missing or
 misconfigured small model degrades to the previous single-model behavior instead of
 breaking.
+
+## Delegation
+
+When the main model is driving a request, it also gets a `delegate_task` tool and can spawn
+the small model as a sub-agent for mechanical legwork — gathering listings, counting things,
+checking status — while it stays on the reasoning.
+
+A sub-agent gets shell access but no delegation tool of its own and no view of the parent
+conversation, so each delegated task has to stand alone. It runs its own agentic loop (up to
+5 steps) and returns a text report as the parent's tool result. Delegations are shown nested
+under the run:
+
+```
+  Running tools
+
+  └─ ornith:35b  Count how many *.py files are in the current directory
+
+     $ ls *.py 2>/dev/null | wc -l
+     4
+
+     → There are 4 *.py files in the current directory.
+```
+
+The small model never delegates — when it owns a request it just runs commands itself.
+
+## Self-check
+
+`ask --test` exercises the whole arrangement against your live server and reports pass/fail,
+exiting nonzero if anything broke:
+
+```
+  eds tui self-check
+  main: qwen3.6:35b    small: ornith:35b
+
+  ✓ server + both models reachable     0.1s   both served
+  ✓ triage: simple → small model       0.8s   → ornith:35b
+  ✓ triage: complex → main model       0.9s   → qwen3.6:35b
+  ✓ --fast forces small model          0.0s   → ornith:35b
+  ✓ --smart forces main model          0.0s   → qwen3.6:35b
+  ✓ delegation: main spawns small     15.6s   qwen3.6:35b spawned ornith:35b ×2
+  ✓ escalation past turn cap           4.2s   turn cap 1 → qwen3.6:35b after 2 turns
+  ✓ bad small model falls back         0.0s   → qwen3.6:35b
+
+  8 passed  0 failed              21.7s
+```
+
+The delegation and escalation checks run real agentic sessions, so their shell commands and
+answers print inline above the result line.
 
 ## Conversation history
 
