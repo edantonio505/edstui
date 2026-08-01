@@ -16,15 +16,38 @@ Add to your `~/.bashrc` or `~/.bash_aliases`:
 ```bash
 export EDS_TUI_URL="http://your-ollama-host:11434"
 export EDS_TUI_TOKEN="your_token_here"   # optional, only if your server requires auth
+
+export EDS_TUI_MODEL="qwen3.6:35b"       # optional, main model
+export EDS_TUI_SMALL_MODEL="ornith:35b"  # optional, model for simpler requests
 ```
+
+Both models must be served from the same Ollama host and support tool calling.
 
 ## Usage
 
 ```bash
 ask                  # start a fresh conversation (clears history)
 ask --continue       # continue the previous conversation
+ask --fast           # force the small model for this request
+ask --smart          # force the main model for this request
 ask --upgrade        # update to the latest version from GitHub
 ```
+
+## Model routing
+
+Every request is triaged before it runs. A short classification call to the small model
+(`ornith:35b`) decides whether the request is simple — a lookup, a listing, a status check,
+a one-off command — or complex enough to need the main model (`qwen3.6:35b`). The whole
+agentic loop then runs on whichever model was picked, and the choice is printed above the
+answer.
+
+Use `--fast` or `--smart` to skip triage and force a model.
+
+If the small model takes a request and then stalls — more than 6 tool-call rounds, or a
+request error — the conversation is handed to the main model and continues from there
+(`↑ escalating to ...`). Triage failures fall back to the main model, so a missing or
+misconfigured small model degrades to the previous single-model behavior instead of
+breaking.
 
 ## Conversation history
 

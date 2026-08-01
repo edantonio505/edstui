@@ -19,7 +19,11 @@ from prompt_toolkit.keys import Keys
 
 console = Console()
 
-_model = "qwen3.6:35b"
+_model = os.environ.get("EDS_TUI_MODEL", "qwen3.6:35b")
+_small_model = os.environ.get("EDS_TUI_SMALL_MODEL", "ornith:35b")
+
+SMALL_MAX_TURNS = 6    # tool-call rounds before escalating off the small model
+HARD_MAX_TURNS = 14    # absolute ceiling, prevents a runaway loop
 
 
 def make_client():
@@ -66,6 +70,35 @@ def build_system_prompt() -> str:
         f"Think step by step before acting. Plan the right command for the task. "
         f"Be direct and concise in your final answer."
     )
+
+
+TRIAGE_SYSTEM = (
+    "You route requests for a terminal assistant. Reply with exactly one word: SIMPLE or COMPLEX.\n"
+    "SIMPLE = answerable directly or with one or two straightforward shell commands "
+    "(lookups, listing files, checking status, short factual questions, a single command).\n"
+    "COMPLEX = needs multi-step reasoning, writing or refactoring code, debugging, planning, "
+    "chaining many commands, or careful judgement.\n"
+    "Output only that one word."
+)
+
+
+def pick_model(client, user_input: str) -> str:
+    """Return the model to run this request on. Falls back to the main model on any doubt."""
+    try:
+        response = client.chat(
+            model=_small_model,
+            messages=[
+                {"role": "system", "content": TRIAGE_SYSTEM},
+                {"role": "user", "content": user_input},
+            ],
+            think=False,
+            options={"temperature": 0, "num_predict": 8},
+        )
+        verdict = (response.message.content or "").strip().upper()
+        return _small_model if verdict.startswith("SIMPLE") else _model
+    except Exception:
+        # Triage must never block the request; when in doubt use the main model.
+        return _model
 
 
 def run_command(command: str) -> str:
@@ -174,11 +207,80 @@ def self_upgrade():
     sys.exit(0)
 
 
+def agentic_loop(client, messages, active_model: str):
+    """
+    Execute the agentic loop: iteratively call the LLM, process tool calls,
+    escalate models when needed, and stop when the assistant gives a final answer.
+
+    Parameters
+    ----------
+    client : ollama.Client
+        The Ollama client to use for API calls.
+    messages : list[dict]
+        Chat history to pass to the model (will be mutated).
+    active_model : str
+        Currently selected model name. Escalation within the loop may change this.
+
+    Returns
+    -------
+    str or None
+        The final assistant message content, or None if the loop was terminated early.
+    """
+    turns = 0
+    while True:
+        turns += 1
+        if turns > HARD_MAX_TURNS:
+            console.print("[red]  Stopped: too many tool-call rounds.[/red]\n")
+            save_history(messages)
+            return None
+
+        if active_model == _small_model and turns > SMALL_MAX_TURNS:
+            console.print(Text(f"  ↑ escalating to {_model}", style="dim yellow"))
+            console.print()
+            active_model = _model
+
+        try:
+            with Live(Spinner("dots2", text=Text("  Thinking...", style="dim italic")),
+                      console=console, refresh_per_second=12, transient=True):
+                response = client.chat(model=active_model, messages=messages, tools=TOOLS)
+        except Exception as e:
+            if active_model == _small_model:
+                console.print(Text(f"  ↑ {_small_model} failed ({e}), escalating to {_model}",
+                                   style="dim yellow"))
+                console.print()
+                active_model = _model
+                continue
+            raise
+
+        msg = response.message
+        messages.append(msg)
+
+        if msg.tool_calls:
+            console.print(Text("  Running tools", style="bold bright_black"))
+            console.print()
+            for tc in msg.tool_calls:
+                command = tc.function.arguments.get("command", "")
+                output = run_command(command)
+                messages.append({"role": "tool", "content": output})
+        else:
+            console.print(Panel(
+                Markdown(msg.content),
+                border_style="cyan",
+                padding=(1, 2),
+                box=box.ROUNDED,
+            ))
+            console.print()
+            save_history(messages)
+            return msg.content
+
+
 def main():
     if "--upgrade" in sys.argv:
         self_upgrade()
 
     is_continue = "--continue" in sys.argv
+    force_fast = "--fast" in sys.argv
+    force_smart = "--smart" in sys.argv
     client = make_client()
 
     print_header()
@@ -231,32 +333,21 @@ def main():
     messages += prior
     messages.append({"role": "user", "content": user_input})
 
-    # Agentic loop
-    while True:
-        with Live(Spinner("dots2", text=Text("  Thinking...", style="dim italic")),
+    # Pick the model: forced by flag, otherwise triaged by the small model
+    if force_smart:
+        active = _model
+    elif force_fast:
+        active = _small_model
+    else:
+        with Live(Spinner("dots2", text=Text("  Routing...", style="dim italic")),
                   console=console, refresh_per_second=12, transient=True):
-            response = client.chat(model=_model, messages=messages, tools=TOOLS)
+            active = pick_model(client, user_input)
 
-        msg = response.message
-        messages.append(msg)
+    console.print(Text(f"  {active}", style="dim"))
+    console.print()
 
-        if msg.tool_calls:
-            console.print(Text("  Running tools", style="bold bright_black"))
-            console.print()
-            for tc in msg.tool_calls:
-                command = tc.function.arguments.get("command", "")
-                output = run_command(command)
-                messages.append({"role": "tool", "content": output})
-        else:
-            console.print(Panel(
-                Markdown(msg.content),
-                border_style="cyan",
-                padding=(1, 2),
-                box=box.ROUNDED,
-            ))
-            console.print()
-            save_history(messages)
-            break
+    # Delegated agentic loop
+    agentic_loop(client, messages, active)
 
 
 if __name__ == "__main__":
