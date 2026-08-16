@@ -17,7 +17,7 @@ Add to your `~/.bashrc` or `~/.bash_aliases`:
 export EDS_TUI_URL="http://your-ollama-host:11434"
 export EDS_TUI_TOKEN="your_token_here"   # optional, only if your server requires auth
 
-export EDS_TUI_MODEL="qwen3.6:35b"       # optional, main model
+export EDS_TUI_MODEL="qwen3.8:latest"    # optional, main model
 export EDS_TUI_SMALL_MODEL="ornith:35b"  # optional, model for simpler requests
 ```
 
@@ -38,7 +38,7 @@ ask --upgrade        # update to the latest version from GitHub
 
 Every request is triaged before it runs. A short classification call to the small model
 (`ornith:35b`) decides whether the request is simple — a lookup, a listing, a status check,
-a one-off command — or complex enough to need the main model (`qwen3.6:35b`). The whole
+a one-off command — or complex enough to need the main model (`qwen3.8:latest`). The whole
 agentic loop then runs on whichever model was picked, and the choice is printed above the
 answer.
 
@@ -91,18 +91,18 @@ exiting nonzero if anything broke:
 
 ```
   eds tui self-check
-  main: qwen3.6:35b    small: ornith:35b
+  main: qwen3.8:latest    small: ornith:35b
 
-  ✓ server + both models reachable     0.1s   both served
-  ✓ triage: simple → small model       0.8s   → ornith:35b
-  ✓ triage: complex → main model       0.9s   → qwen3.6:35b
+  ✓ server + both models reachable     0.0s   both served
+  ✓ triage: simple → small model       1.1s   → ornith:35b
+  ✓ triage: complex → main model       0.9s   → qwen3.8:latest
   ✓ --fast forces small model          0.0s   → ornith:35b
-  ✓ --smart forces main model          0.0s   → qwen3.6:35b
-  ✓ delegation: main spawns small     15.6s   qwen3.6:35b spawned ornith:35b ×2
-  ✓ escalation past turn cap           4.2s   turn cap 1 → qwen3.6:35b after 2 turns
-  ✓ bad small model falls back         0.0s   → qwen3.6:35b
+  ✓ --smart forces main model          0.0s   → qwen3.8:latest
+  ✓ delegation: main spawns small     23.7s   qwen3.8:latest spawned ornith:35b ×2
+  ✓ escalation past turn cap           7.9s   turn cap 1 → qwen3.8:latest after 3 turns
+  ✓ bad small model falls back         0.0s   → qwen3.8:latest
 
-  8 passed  0 failed              21.7s
+  8 passed  0 failed              33.6s
 ```
 
 The delegation and escalation checks run real agentic sessions, so their shell commands and
