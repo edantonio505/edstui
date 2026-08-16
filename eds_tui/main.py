@@ -20,7 +20,7 @@ from prompt_toolkit.keys import Keys
 
 console = Console()
 
-_model = os.environ.get("EDS_TUI_MODEL", "qwen3.6:35b")
+_model = os.environ.get("EDS_TUI_MODEL", "qwen3.8:latest")
 _small_model = os.environ.get("EDS_TUI_SMALL_MODEL", "ornith:35b")
 
 SMALL_MAX_TURNS = 6    # tool-call rounds before escalating off the small model
