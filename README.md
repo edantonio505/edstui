@@ -92,8 +92,27 @@ model: main
 
 Frontmatter is flat `key: value` only. Nested YAML is not supported.
 
-`ask --skill-new deploy-flow` writes a starter file. `ask --skills` lists what is installed,
-including anything that failed to parse and why.
+### Writing one
+
+Three ways, in increasing order of how much you should trust the result:
+
+- `ask --skill-new deploy-flow` scaffolds a starter file for you to fill in.
+- **Ask `ask` for it** — "remember how to check what's using a port, make it a skill". The main
+  model has a `create_skill` tool: it writes the file and immediately re-reads it through the
+  real parser, so it finds out then and there whether the skill actually registers, and reports
+  the error if not. Bad names (`../../.bashrc`), missing descriptions and multi-line descriptions
+  are rejected before anything is written.
+- Write the file yourself.
+
+`ask --skills` lists what is installed, including anything that failed to parse and why.
+
+**Read what the model writes before trusting it.** `create_skill` guarantees the *file* is valid,
+not that the *commands in it* are correct — and a wrong command in a skill is wrong every time it
+runs, in a shell with no confirmation prompt. Two real examples from generated skills: a filter
+written as `grep -vxE 'main|$(git branch --show-current)'`, where single quotes block the
+substitution so the safety check silently does nothing; and `ss -ltn 'dport = :53'` offered as a
+way to find a listener, which always returns zero rows because listening sockets have no peer
+port. Both looked entirely plausible.
 
 ### How a skill gets selected
 
@@ -104,8 +123,10 @@ Three ways, most explicit first:
    any) covers your request. Both questions run concurrently, so this costs a round trip but
    almost no wall-clock, and it costs zero tool-call rounds. The chosen skill is shown on the
    status line: `qwen3.8:latest  ·  skill: deploy-flow`.
-3. **The model loads it mid-run** — the main model always sees the list of skill names and
-   descriptions and can call `load_skill` to pull one in when it decides it needs it.
+3. **The model loads or writes one mid-run** — the main model always sees the list of skill
+   names and descriptions, and can call `load_skill` to pull one in when it decides it needs
+   it, or `create_skill` to save a new one. `create_skill` is available even when nothing is
+   installed yet — that is how the first skill gets written.
 
 The two triage questions are asked in **separate calls** on purpose. Asking the small model for
 a complexity verdict and a skill name in one reply measured 4/10 on a fixture set — it answers
@@ -179,10 +200,12 @@ directory — they never touch your real `~/.eds_tui/skills`:
   ✓ bad small model falls back         0.0s   → qwen3.8:latest
   ✓ skills: discovered and parsed      0.0s   name, description, model and body round-tripped
   ✓ skills: triage matches a skill     1.3s   → selfcheck-widget
-  ✓ skills: load_skill returns body   18.7s   qwen3.8:latest called load_skill ×1
+  ✓ skills: load_skill returns body    9.6s   qwen3.8:latest called load_skill ×1
+  ✓ skills: create_skill writes+parses 14.1s   wrote and re-parsed 'selfcheck-made'
+  ✓ skills: write rejects bad input    0.0s   3 bad inputs rejected, newline folded
   ✓ skills: /name pin vs flag          0.0s   pin → ornith:35b, --smart overrides → qwen3.8:latest
 
-  12 passed  0 failed              49.9s
+  14 passed  0 failed              60.0s
 ```
 
 The delegation, escalation and skill-loading checks run real agentic sessions, so their shell commands and

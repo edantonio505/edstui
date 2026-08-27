@@ -117,16 +117,72 @@ LOAD_SKILL_TOOL = {
     }
 }
 
+CREATE_SKILL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "create_skill",
+        "description": (
+            "Save a reusable procedure as a skill, so it is available in later runs without "
+            "the user explaining it again. Use it when the user asks you to remember how to "
+            "do something, or to write or update a skill. The file is written and then "
+            "re-read to confirm it registers, and you are told either way."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Short lowercase identifier, e.g. 'git-cleanup'. Letters, digits, "
+                        "dots, dashes and underscores only."
+                    )
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "One line saying when to reach for this skill. This is the only text "
+                        "matched against future requests, so name the specific subject rather "
+                        "than describing it in general terms."
+                    )
+                },
+                "body": {
+                    "type": "string",
+                    "description": (
+                        "The procedure itself, in Markdown. Write it for someone who has a "
+                        "shell but was not part of this conversation."
+                    )
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Which model should run it: 'main' for reasoning-heavy work, 'small' "
+                        "for mechanical work, 'any' to let triage decide. Defaults to 'any'."
+                    )
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Set true to replace a skill that already exists."
+                }
+            },
+            "required": ["name", "description", "body"]
+        }
+    }
+}
+
 SHELL_TOOLS = [RUN_COMMAND_TOOL]                    # sub-agent and small model: shell only
 
 
 def tools_for(model: str):
-    """The main model can delegate and load skills; the small model just runs commands."""
+    """
+    The main model can delegate, write skills and load them; the small model just
+    runs commands. create_skill is never gated on the registry -- it is how the
+    first skill gets written.
+    """
     if model != _model:
         return SHELL_TOOLS
-    tools = [RUN_COMMAND_TOOL, DELEGATE_TOOL]
+    tools = [RUN_COMMAND_TOOL, DELEGATE_TOOL, CREATE_SKILL_TOOL]
     if skills.discover():
-        tools.append(LOAD_SKILL_TOOL)   # nothing installed, nothing to advertise
+        tools.append(LOAD_SKILL_TOOL)   # nothing installed, nothing to load
     return tools
 
 
@@ -154,6 +210,10 @@ def build_system_prompt(model: str = None, skill: dict = None) -> str:
         f"on the reasoning and the final answer. Each delegated task must stand alone, since "
         f"the helper cannot see this conversation. Run commands yourself when the work is "
         f"trivial or needs your judgement. "
+        f"If a create_skill tool is available to you, use it when the user asks you to "
+        f"remember a procedure, or to write or update a skill. Put the specific subject in "
+        f"the description — that one line is all that future requests are matched against — "
+        f"and write the body for someone who has a shell but none of this conversation. "
         f"Think step by step before acting. Plan the right command for the task. "
         f"Be direct and concise in your final answer."
     )
@@ -439,6 +499,52 @@ def load_skill(name: str) -> str:
     return f"There is no skill named '{name}'. The skills that exist are:\n{index}"
 
 
+def as_bool(value):
+    """Tool arguments arrive as whatever the model felt like emitting, strings included."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return bool(value)
+
+
+def create_skill(args: dict) -> str:
+    """
+    Write a skill the model composed, and tell it plainly whether the file registered.
+
+    Failures come back as an ordinary tool result rather than an exception, so a bad
+    name or a missing description costs the model one turn to correct instead of
+    ending the run.
+    """
+    name = args.get("name", "")
+
+    label = Text()
+    label.append("  ◆ ", style="bold blue")
+    label.append("create skill ", style="bold blue")
+    label.append(name or "(unnamed)", style="bold white")
+    console.print(label)
+
+    try:
+        skill = skills.write(
+            name=name,
+            description=args.get("description", ""),
+            body=args.get("body", ""),
+            model=args.get("model", "any"),
+            overwrite=as_bool(args.get("overwrite", False)),
+        )
+    except Exception as e:
+        console.print(Text(f"     ✗ {e}", style="red"))
+        console.print()
+        return f"create_skill failed: {e}"
+
+    path = os.path.join(skill["dir"], "SKILL.md")
+    console.print(Text(f"     → wrote {path}", style="dim"))
+    console.print(Text(f"     → re-parsed: registers as '{skill['name']}', "
+                       f"model {skill['model']}", style="dim"))
+    console.print()
+
+    return (f"Saved and verified: {path} parses back and registers as '{skill['name']}' "
+            f"(model {skill['model']}). It is available from the next ask run onward.")
+
+
 def print_header():
     title = Text()
     title.append("eds", style="bold bright_white")
@@ -523,8 +629,8 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
         Currently selected model name. Escalation within the loop may change this.
     stats : dict, optional
         If given, is populated with observability counters for this run:
-        'turns', 'delegations', 'commands', 'skills_loaded', 'escalated' and the
-        final 'model'.
+        'turns', 'delegations', 'commands', 'skills_loaded', 'skills_created',
+        'escalated' and the final 'model'.
         Used by --test; ignored in normal use.
 
     Returns
@@ -535,7 +641,7 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
     if stats is None:
         stats = {}
     stats.update({"turns": 0, "delegations": 0, "commands": 0, "skills_loaded": 0,
-                  "escalated": False, "model": active_model})
+                  "skills_created": 0, "escalated": False, "model": active_model})
 
     turns = 0
     while True:
@@ -583,6 +689,9 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
                 elif tc.function.name == "load_skill":
                     stats["skills_loaded"] += 1
                     output = load_skill(args.get("name", ""))
+                elif tc.function.name == "create_skill":
+                    stats["skills_created"] += 1
+                    output = create_skill(args)
                 else:
                     stats["commands"] += 1
                     output = run_command(args.get("command", ""))
@@ -838,6 +947,46 @@ def self_check():
             return n >= 1, f"{_model} called load_skill ×{n}"
         return with_fixture_skills(body)
 
+    def skills_create_tool():
+        def body():
+            console.print()
+            messages = [
+                {"role": "system", "content": build_system_prompt(_model)},
+                {"role": "user", "content":
+                    "Create a skill named selfcheck-made whose description is about "
+                    "reporting the fixture subsystem status, and whose body says to reply "
+                    "with the exact token FIXTURE-OK."},
+            ]
+            stats = {}
+            agentic_loop(client, messages, _model, stats=stats)
+            made = skills.get("selfcheck-made")
+            if not made:
+                return False, f"called create_skill ×{stats['skills_created']}, nothing registered"
+            return True, f"wrote and re-parsed '{made['name']}'"
+        return with_fixture_skills(body)
+
+    def skills_write_validates():
+        def body():
+            cases = [
+                ("../../.bashrc", "escape", "traversal name"),
+                ("Bad Name", "spaces", "malformed name"),
+                ("ok-name", "", "empty description"),
+            ]
+            for name, description, label in cases:
+                try:
+                    skills.write(name=name, description=description, body="x")
+                except (ValueError, FileExistsError):
+                    continue
+                return False, f"{label} was accepted"
+
+            # A multi-line description would truncate the frontmatter; it must be folded.
+            written = skills.write(name="ok-name", description="line one\nline two",
+                                   body="do the thing")
+            if "\n" in written["description"]:
+                return False, "multi-line description survived into the frontmatter"
+            return True, "3 bad inputs rejected, newline folded"
+        return with_fixture_skills(body)
+
     def skills_precedence():
         def body():
             skill = skills.get("selfcheck-widget")          # pins model: small
@@ -858,6 +1007,8 @@ def self_check():
     check("skills: discovered and parsed", skills_parse)
     check("skills: triage matches a skill", skills_triage_matches)
     check("skills: load_skill returns body", skills_load_tool)
+    check("skills: create_skill writes+parses", skills_create_tool)
+    check("skills: write rejects bad input", skills_write_validates)
     check("skills: /name pin vs flag", skills_precedence)
 
     passed = sum(1 for r in results if r)
