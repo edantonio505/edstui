@@ -16,9 +16,15 @@ will follow, so picking them up from whatever repo happens to be cd'd into
 would be a prompt-injection path straight into run_command.
 """
 import os
+import re
 
 SKILLS_DIR = os.path.expanduser("~/.eds_tui/skills")
 VALID_MODELS = ("main", "small", "any")
+
+# A skill name becomes a directory name, and may arrive from a language model, so
+# it is validated before it is ever joined onto a path -- '../../.bashrc' must
+# never be a write target.
+NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 TEMPLATE = """---
 name: {name}
@@ -152,6 +158,57 @@ def render(skill):
         f"{skill['body']}\n"
         f"--- end skill: {skill['name']} ---"
     )
+
+
+def write(name, description, body, model="any", overwrite=False):
+    """
+    Create or replace a skill on disk, then re-read it to prove it registers.
+
+    Every argument can come from a model, so all of them are validated here rather
+    than trusted. Raises with a message written to be handed straight back to the
+    model as a tool result, so it can correct itself and retry.
+    """
+    name = (name or "").strip()
+    if not NAME_PATTERN.match(name):
+        raise ValueError(
+            "name must start with a letter or digit and contain only lowercase "
+            f"letters, digits, dots, dashes or underscores — got '{name}'"
+        )
+
+    # Frontmatter is one key per line, so a multi-line description would truncate
+    # the skill's only searchable field and take the rest of it into the void.
+    description = " ".join((description or "").split())
+    if not description:
+        raise ValueError("description is required — it is the text skill matching searches")
+
+    model = (model or "any").strip().lower()
+    if model not in VALID_MODELS:
+        raise ValueError(f"model must be one of {', '.join(VALID_MODELS)} — got '{model}'")
+
+    body = (body or "").strip()
+    if not body:
+        raise ValueError("body is required — it is the procedure the model follows")
+
+    directory = os.path.join(SKILLS_DIR, name)
+    path = os.path.join(directory, "SKILL.md")
+    if os.path.exists(path) and not overwrite:
+        raise FileExistsError(
+            f"a skill named '{name}' already exists — pass overwrite to replace it"
+        )
+
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"---\nname: {name}\ndescription: {description}\n"
+                f"model: {model}\n---\n\n{body}\n")
+
+    # Round-trip through the real parser: writing a file that does not register
+    # is a silent failure, and the model needs to hear about it now.
+    reset_cache()
+    written = get(name)
+    if not written:
+        raise ValueError(f"wrote {path} but it did not parse back — inspect it by hand")
+
+    return written
 
 
 def reset_cache():
