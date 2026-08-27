@@ -4,6 +4,9 @@ import sys
 import re
 import json
 import subprocess
+import shutil
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import time
 import ollama
 from rich.console import Console
@@ -17,6 +20,11 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.keys import Keys
+
+try:
+    from . import skills
+except ImportError:     # running main.py directly rather than as a package
+    import skills
 
 console = Console()
 
@@ -87,24 +95,52 @@ DELEGATE_TOOL = {
     }
 }
 
+LOAD_SKILL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "load_skill",
+        "description": (
+            "Load the full instructions for one of the skills listed in your system prompt. "
+            "Use it when the request matches a skill's description and you have not already "
+            "been given that skill's text. Returns the skill's procedure, which you then follow."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The skill's name, exactly as listed in your system prompt"
+                }
+            },
+            "required": ["name"]
+        }
+    }
+}
+
 SHELL_TOOLS = [RUN_COMMAND_TOOL]                    # sub-agent and small model: shell only
-MAIN_TOOLS = [RUN_COMMAND_TOOL, DELEGATE_TOOL]      # main model: shell + delegation
 
 
 def tools_for(model: str):
-    """The main model can delegate; the small model just runs commands."""
-    return MAIN_TOOLS if model == _model else SHELL_TOOLS
+    """The main model can delegate and load skills; the small model just runs commands."""
+    if model != _model:
+        return SHELL_TOOLS
+    tools = [RUN_COMMAND_TOOL, DELEGATE_TOOL]
+    if skills.discover():
+        tools.append(LOAD_SKILL_TOOL)   # nothing installed, nothing to advertise
+    return tools
 
 
-def build_system_prompt() -> str:
-    return (
+def build_system_prompt(model: str = None, skill: dict = None) -> str:
+    model = model or _model
+    prompt = (
         f"You are 'eds tui', a helpful terminal assistant invoked as 'ask', running on "
         f"Ubuntu Linux. "
         f"The user's current working directory is: {os.getcwd()}. "
         f"All commands run relative to this directory unless a full path is needed. "
-        f"Your own source code is at {APP_ENTRY} — that is the copy currently running. "
+        f"Your own source code is the package at {APP_DIR} — main.py is the entry point and "
+        f"skills.py is the skill registry — and that is the copy currently running. "
         f"When the user asks about you (your flags, options, features, or behavior), read "
-        f"that file and answer from it. Do not infer your own behavior from files in the "
+        f"those files and answer from them. Do not infer your own behavior from files in the "
         f"working directory: they may be unrelated programs, or stale copies that are not "
         f"what is running. "
         f"You have access to the user's terminal via the run_command tool. "
@@ -122,6 +158,26 @@ def build_system_prompt() -> str:
         f"Be direct and concise in your final answer."
     )
 
+    if skill:
+        prompt += (
+            "\n\nA skill has been selected for this request. Follow it.\n\n"
+            + skills.render(skill)
+        )
+
+    # The index is names and one-liners only -- that is the whole point of skills,
+    # and it is useless to a model that has no load_skill tool to act on it.
+    available = dict(skills.discover())
+    if skill:
+        available.pop(skill["name"], None)
+    if available and model == _model:
+        prompt += (
+            f"\n\nOther skills you can load:\n{skills.index_lines(available)}\n"
+            f"Call load_skill with one of those names when the request matches its "
+            f"description. If none match, ignore this list."
+        )
+
+    return prompt
+
 
 TRIAGE_SYSTEM = (
     "You route requests for a terminal assistant. Reply with exactly one word: SIMPLE or COMPLEX.\n"
@@ -133,18 +189,17 @@ TRIAGE_SYSTEM = (
 )
 
 
-def resolve_model(client, user_input: str, force_fast: bool = False,
-                  force_smart: bool = False) -> str:
-    """Which model owns this request: forced by flag, otherwise triaged."""
-    if force_smart:
-        return _model
-    if force_fast:
-        return _small_model
-    return pick_model(client, user_input)
+SKILL_MATCH_SYSTEM = (
+    "You match a user's request to a skill for a terminal assistant.\n"
+    "Reply with exactly one word: the name of the skill below whose description covers "
+    "the request, or NONE if none of them do.\n"
+    "Skills:\n{index}\n"
+    "Output only that one word."
+)
 
 
-def pick_model(client, user_input: str) -> str:
-    """Return the model to run this request on. Falls back to the main model on any doubt."""
+def classify_complexity(client, user_input: str) -> str:
+    """Which model should own this request. Falls back to the main model on any doubt."""
     try:
         response = client.chat(
             model=_small_model,
@@ -155,11 +210,98 @@ def pick_model(client, user_input: str) -> str:
             think=False,
             options={"temperature": 0, "num_predict": 8},
         )
-        verdict = (response.message.content or "").strip().upper()
-        return _small_model if verdict.startswith("SIMPLE") else _model
+        verdict = (response.message.content or "").upper()
     except Exception:
         # Triage must never block the request; when in doubt use the main model.
         return _model
+
+    # The small model wraps its verdict in whatever punctuation it feels like, and
+    # sometimes echoes the whole instruction back. Both words present means it did
+    # not actually decide, so fail closed to the main model.
+    if "SIMPLE" in verdict and "COMPLEX" not in verdict:
+        return _small_model
+    return _model
+
+
+def match_skill(client, user_input: str):
+    """
+    Which skill covers this request, if any.
+
+    Deliberately a separate call from classify_complexity. Asking ornith for a verdict
+    and a skill name in one reply measured 4/10 against these fixtures -- it answers
+    one question and falls back to the first skill in the list for the other. Asking
+    each on its own measured 12/12.
+    """
+    index = skills.index_lines()
+    if not index:
+        return None
+
+    try:
+        response = client.chat(
+            model=_small_model,
+            messages=[
+                {"role": "system", "content": SKILL_MATCH_SYSTEM.format(index=index)},
+                {"role": "user", "content": user_input},
+            ],
+            think=False,
+            options={"temperature": 0, "num_predict": 12},
+        )
+    except Exception:
+        return None         # no skill is always a safe answer
+
+    # Only real names match, so a hallucinated skill reads as no skill at all.
+    return skills.match(response.message.content)
+
+
+def triage(client, user_input: str):
+    """
+    Route a request: which model owns it, and which skill applies.
+
+    The two questions run concurrently, so installing skills costs an extra round
+    trip but almost no extra wall-clock, and the complexity verdict stays exactly
+    what it would have been with no skills installed.
+    """
+    if not skills.discover():
+        return classify_complexity(client, user_input), None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        model = pool.submit(classify_complexity, client, user_input)
+        skill = pool.submit(match_skill, client, user_input)
+        return model.result(), skill.result()
+
+
+def pin_for(skill: dict):
+    """The model a skill pins itself to via its 'model:' field, or None if it doesn't care."""
+    if not skill:
+        return None
+    return {"main": _model, "small": _small_model}.get(skill["model"])
+
+
+def resolve_model(client, user_input: str, force_fast: bool = False,
+                  force_smart: bool = False, skill: dict = None):
+    """
+    Decide which model owns this request and which skill applies.
+
+    Precedence, most explicit first: a flag the user typed just now, then the
+    skill's own 'model:' field, then the triage verdict. --fast and --smart skip
+    triage entirely, so they also skip skill auto-matching -- name one with
+    /skill-name to combine the two.
+    """
+    if force_fast:
+        return _small_model, skill
+    if force_smart:
+        return _model, skill
+
+    pinned = pin_for(skill)
+    if pinned:
+        return pinned, skill        # an explicit skill that names its model needs no call
+
+    model, matched = triage(client, user_input)
+    if skill is None:
+        skill = matched
+        model = pin_for(skill) or model
+
+    return model, skill
 
 
 def indent_lines(text: str, indent: str) -> str:
@@ -274,6 +416,29 @@ def delegate_task(client, task: str) -> str:
     )
 
 
+def load_skill(name: str) -> str:
+    """
+    Hand a skill's full text back to the model. An unknown name returns the list of
+    real ones rather than an error, so a wrong guess costs a turn instead of the run.
+    """
+    skill = skills.get(name)
+
+    label = Text()
+    label.append("  ◆ ", style="bold blue")
+    label.append("skill ", style="bold blue")
+    label.append(name or "(unnamed)", style="bold white" if skill else "red")
+    console.print(label)
+    console.print()
+
+    if skill:
+        return skills.render(skill)
+
+    index = skills.index_lines()
+    if not index:
+        return f"There is no skill named '{name}', and no skills are installed."
+    return f"There is no skill named '{name}'. The skills that exist are:\n{index}"
+
+
 def print_header():
     title = Text()
     title.append("eds", style="bold bright_white")
@@ -358,7 +523,8 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
         Currently selected model name. Escalation within the loop may change this.
     stats : dict, optional
         If given, is populated with observability counters for this run:
-        'turns', 'delegations', 'commands', 'escalated' and the final 'model'.
+        'turns', 'delegations', 'commands', 'skills_loaded', 'escalated' and the
+        final 'model'.
         Used by --test; ignored in normal use.
 
     Returns
@@ -368,7 +534,7 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
     """
     if stats is None:
         stats = {}
-    stats.update({"turns": 0, "delegations": 0, "commands": 0,
+    stats.update({"turns": 0, "delegations": 0, "commands": 0, "skills_loaded": 0,
                   "escalated": False, "model": active_model})
 
     turns = 0
@@ -414,6 +580,9 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
                 if tc.function.name == "delegate_task":
                     stats["delegations"] += 1
                     output = delegate_task(client, args.get("task", ""))
+                elif tc.function.name == "load_skill":
+                    stats["skills_loaded"] += 1
+                    output = load_skill(args.get("name", ""))
                 else:
                     stats["commands"] += 1
                     output = run_command(args.get("command", ""))
@@ -430,6 +599,89 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
             return msg.content
 
 
+def print_skills():
+    """List installed skills, and anything that failed to parse. Used by --skills."""
+    found = skills.discover()
+    console.print()
+
+    if not found:
+        console.print(Text("  No skills installed.", style="dim"))
+        console.print(Text(f"  They live in {skills.SKILLS_DIR}", style="dim"))
+        console.print(Text("  Create one with:  ask --skill-new <name>", style="dim"))
+    else:
+        console.print(Text(f"  {len(found)} skill(s) in {skills.SKILLS_DIR}",
+                           style="bold bright_white"))
+        console.print()
+        for skill in found.values():
+            line = Text("  ")
+            line.append(skill["name"], style="bold cyan")
+            if skill["model"] != "any":
+                line.append(f"  [{skill['model']} model]", style="dim yellow")
+            console.print(line)
+            console.print(Text(f"      {skill['description']}", style="dim"))
+
+    broken = skills.problems()
+    if broken:
+        console.print()
+        console.print(Text("  Skipped, could not parse:", style="bold red"))
+        for entry, reason in broken:
+            console.print(Text(f"    {entry}: {reason}", style="red"))
+
+    console.print()
+
+
+def scaffold_skill(name: str):
+    """Write a starter SKILL.md so the format is discoverable without reading the source."""
+    directory = os.path.join(skills.SKILLS_DIR, name)
+    path = os.path.join(directory, "SKILL.md")
+
+    if os.path.exists(path):
+        console.print(Text(f"\n  {path} already exists.\n", style="red"))
+        sys.exit(1)
+
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(skills.TEMPLATE.format(name=name))
+
+    console.print(Text(f"\n  Created {path}", style="green"))
+    console.print(Text("  Edit the description first — it is all the model sees "
+                       "until the skill loads.\n", style="dim"))
+    sys.exit(0)
+
+
+def extract_skill(user_input: str):
+    """
+    Pull a leading /skill-name off the request. Returns (request, skill_or_None).
+    An unknown name exits with the list rather than sending '/typo' to the model.
+    """
+    if not user_input.startswith("/"):
+        return user_input, None
+
+    name, _, rest = user_input[1:].partition(" ")
+    skill = skills.get(name)
+    if not skill:
+        console.print(Text(f"\n  No skill named '{name}'.", style="red"))
+        print_skills()
+        sys.exit(1)
+
+    return rest.strip() or f"Run the {skill['name']} skill.", skill
+
+
+def looks_like_a_shell_flag(text: str) -> bool:
+    """Flags belong on the shell command line, not typed at the ❯ prompt."""
+    stripped = text.strip()
+    return stripped.startswith("--") or stripped.startswith("ask -")
+
+
+def shell_flag_hint(text: str):
+    stripped = text.strip()
+    command = stripped if stripped.startswith("ask ") else f"ask {stripped}"
+    console.print(Text("  That is a command-line flag, not a question.", style="yellow"))
+    console.print(Text(f"  Run it from your shell instead:  {command}", style="dim"))
+    console.print()
+    sys.exit(0)
+
+
 SIMPLE_PROBE = "how many .py files are in this directory"
 COMPLEX_PROBE = ("refactor the agentic loop into its own module and explain the "
                  "tradeoffs of each approach")
@@ -437,6 +689,18 @@ DELEGATION_PROBE = ("Delegate two subtasks: first, count how many *.py files are
                     "current directory; second, report the name of the current git branch. "
                     "Then give me both answers.")
 ESCALATION_PROBE = "Run 'pwd', then separately run 'whoami', then report both results."
+
+# A skill nothing else on the machine could satisfy, so a match proves the skill
+# reached the model rather than the model already knowing the answer.
+FIXTURE_SKILL = """---
+name: selfcheck-widget
+description: Report the status of the widget subsystem. Only this skill knows how.
+model: small
+---
+
+When asked about the widget subsystem, reply with exactly: WIDGET-OK
+"""
+SKILL_PROBE = "what is the status of the widget subsystem"
 
 
 def self_check():
@@ -476,24 +740,24 @@ def self_check():
         return not missing, "both served" if not missing else f"missing: {', '.join(missing)}"
 
     def triage_simple():
-        picked = pick_model(client, SIMPLE_PROBE)
+        picked, _ = triage(client, SIMPLE_PROBE)
         return picked == _small_model, f"→ {picked}"
 
     def triage_complex():
-        picked = pick_model(client, COMPLEX_PROBE)
+        picked, _ = triage(client, COMPLEX_PROBE)
         return picked == _model, f"→ {picked}"
 
     def fast_forces_small():
-        picked = resolve_model(client, COMPLEX_PROBE, force_fast=True)
+        picked, _ = resolve_model(client, COMPLEX_PROBE, force_fast=True)
         return picked == _small_model, f"→ {picked}"
 
     def smart_forces_main():
-        picked = resolve_model(client, SIMPLE_PROBE, force_smart=True)
+        picked, _ = resolve_model(client, SIMPLE_PROBE, force_smart=True)
         return picked == _model, f"→ {picked}"
 
     def delegation_works():
         console.print()
-        messages = [{"role": "system", "content": build_system_prompt()},
+        messages = [{"role": "system", "content": build_system_prompt(_model)},
                     {"role": "user", "content": DELEGATION_PROBE}]
         stats = {}
         agentic_loop(client, messages, _model, stats=stats)
@@ -505,7 +769,7 @@ def self_check():
         original = SMALL_MAX_TURNS
         globals()["SMALL_MAX_TURNS"] = 1
         try:
-            messages = [{"role": "system", "content": build_system_prompt()},
+            messages = [{"role": "system", "content": build_system_prompt(_small_model)},
                         {"role": "user", "content": ESCALATION_PROBE}]
             stats = {}
             agentic_loop(client, messages, _small_model, stats=stats)
@@ -517,10 +781,71 @@ def self_check():
         original = _small_model
         globals()["_small_model"] = "does-not-exist:1b"
         try:
-            picked = pick_model(client, SIMPLE_PROBE)
+            picked, _ = triage(client, SIMPLE_PROBE)
             return picked == _model, f"→ {picked}"
         finally:
             globals()["_small_model"] = original
+
+    def with_fixture_skills(fn):
+        """
+        Run fn against a throwaway fixture skill. --test must never touch the
+        user's real ~/.eds_tui/skills, so SKILLS_DIR is repointed and restored.
+        """
+        tmp = tempfile.mkdtemp(prefix="eds-tui-selfcheck-")
+        original = skills.SKILLS_DIR
+        try:
+            directory = os.path.join(tmp, "selfcheck-widget")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "SKILL.md"), "w") as f:
+                f.write(FIXTURE_SKILL)
+            skills.SKILLS_DIR = tmp
+            skills.reset_cache()
+            return fn()
+        finally:
+            skills.SKILLS_DIR = original
+            skills.reset_cache()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def skills_parse():
+        def body():
+            found = skills.discover()
+            skill = found.get("selfcheck-widget")
+            if not skill:
+                return False, f"fixture not discovered ({list(found)})"
+            ok = skill["model"] == "small" and "WIDGET-OK" in skill["body"]
+            return ok, "name, description, model and body round-tripped"
+        return with_fixture_skills(body)
+
+    def skills_triage_matches():
+        def body():
+            _, skill = triage(client, SKILL_PROBE)
+            return bool(skill and skill["name"] == "selfcheck-widget"), \
+                f"→ {skill['name'] if skill else 'no match'}"
+        return with_fixture_skills(body)
+
+    def skills_load_tool():
+        def body():
+            console.print()
+            messages = [
+                {"role": "system", "content": build_system_prompt(_model)},
+                {"role": "user", "content":
+                    "Load the selfcheck-widget skill, follow it, and report the "
+                    "widget subsystem status."},
+            ]
+            stats = {}
+            agentic_loop(client, messages, _model, stats=stats)
+            n = stats["skills_loaded"]
+            return n >= 1, f"{_model} called load_skill ×{n}"
+        return with_fixture_skills(body)
+
+    def skills_precedence():
+        def body():
+            skill = skills.get("selfcheck-widget")          # pins model: small
+            pinned, _ = resolve_model(client, COMPLEX_PROBE, skill=skill)
+            forced, _ = resolve_model(client, COMPLEX_PROBE, force_smart=True, skill=skill)
+            return pinned == _small_model and forced == _model, \
+                f"pin → {pinned}, --smart overrides → {forced}"
+        return with_fixture_skills(body)
 
     check("server + both models reachable", models_present)
     check("triage: simple → small model", triage_simple)
@@ -530,6 +855,10 @@ def self_check():
     check("delegation: main spawns small", delegation_works)
     check("escalation past turn cap", escalation_fires)
     check("bad small model falls back", bad_small_model_falls_back)
+    check("skills: discovered and parsed", skills_parse)
+    check("skills: triage matches a skill", skills_triage_matches)
+    check("skills: load_skill returns body", skills_load_tool)
+    check("skills: /name pin vs flag", skills_precedence)
 
     passed = sum(1 for r in results if r)
     failed = len(results) - passed
@@ -547,6 +876,17 @@ def self_check():
 def main():
     if "--upgrade" in sys.argv:
         self_upgrade()
+
+    if "--skills" in sys.argv:
+        print_skills()
+        sys.exit(0)
+
+    if "--skill-new" in sys.argv:
+        i = sys.argv.index("--skill-new")
+        if i + 1 >= len(sys.argv):
+            console.print(Text("\n  Usage: ask --skill-new <name>\n", style="red"))
+            sys.exit(1)
+        scaffold_skill(sys.argv[i + 1])
 
     if "--test" in sys.argv:
         self_check()
@@ -602,20 +942,29 @@ def main():
 
     console.print()
 
-    messages = [{"role": "system", "content": build_system_prompt()}]
-    messages += prior
-    messages.append({"role": "user", "content": user_input})
+    if looks_like_a_shell_flag(user_input):
+        shell_flag_hint(user_input)
 
-    # Pick the model: forced by flag, otherwise triaged by the small model
-    if force_fast or force_smart:
-        active = resolve_model(client, user_input, force_fast, force_smart)
+    user_input, skill = extract_skill(user_input)
+
+    # Pick the model and the skill: forced by flag or /name, otherwise triaged.
+    # A forced model needs no call, and neither does a skill that pins one.
+    if force_fast or force_smart or pin_for(skill):
+        active, skill = resolve_model(client, user_input, force_fast, force_smart, skill)
     else:
         with Live(Spinner("dots2", text=Text("  Routing...", style="dim italic")),
                   console=console, refresh_per_second=12, transient=True):
-            active = resolve_model(client, user_input)
+            active, skill = resolve_model(client, user_input, skill=skill)
 
-    console.print(Text(f"  {active}", style="dim"))
+    status = Text(f"  {active}", style="dim")
+    if skill:
+        status.append(f"  ·  skill: {skill['name']}", style="dim cyan")
+    console.print(status)
     console.print()
+
+    messages = [{"role": "system", "content": build_system_prompt(active, skill)}]
+    messages += prior
+    messages.append({"role": "user", "content": user_input})
 
     # Delegated agentic loop
     agentic_loop(client, messages, active)

@@ -30,7 +30,9 @@ ask                  # start a fresh conversation (clears history)
 ask --continue       # continue the previous conversation
 ask --fast           # force the small model for this request
 ask --smart          # force the main model for this request
-ask --test           # self-check: prove routing, delegation and escalation work
+ask --skills         # list installed skills
+ask --skill-new NAME # scaffold a new skill
+ask --test           # self-check: prove routing, skills, delegation and escalation work
 ask --upgrade        # update to the latest version from GitHub
 ```
 
@@ -42,7 +44,8 @@ a one-off command — or complex enough to need the main model (`qwen3.8:latest`
 agentic loop then runs on whichever model was picked, and the choice is printed above the
 answer.
 
-Use `--fast` or `--smart` to skip triage and force a model.
+Use `--fast` or `--smart` to skip triage and force a model. When you have skills installed,
+a second concurrent call asks which of them applies — see [Skills](#skills).
 
 If the small model takes a request and then stalls — more than 6 tool-call rounds, or a
 request error — the conversation is handed to the main model and continues from there
@@ -50,12 +53,84 @@ request error — the conversation is handed to the main model and continues fro
 misconfigured small model degrades to the previous single-model behavior instead of
 breaking.
 
+## Skills
+
+A skill is a reusable procedure you write once and `ask` loads when it is relevant — how *you*
+ship a release, how *you* restore a dev database, the three commands that actually diagnose a
+bad deploy on *your* machine. Without them, any such procedure has to be retyped as part of the
+question every single run.
+
+They live in `~/.eds_tui/skills/`, one directory each:
+
+```
+~/.eds_tui/skills/
+  deploy-flow/
+    SKILL.md
+  triage-logs/
+    SKILL.md
+    check.sh          # optional; reference it from the body by full path
+```
+
+`SKILL.md` is frontmatter plus a Markdown body:
+
+```markdown
+---
+name: deploy-flow
+description: Ship a release from this repo — branch checks, tag, push, verify.
+model: main
+---
+
+1. Confirm the working tree is clean and we are not on `main`.
+2. ...
+```
+
+- `description` is **required**. It is the only thing the model sees until the skill loads, so
+  make it specific — that is what selection matches against.
+- `name` defaults to the directory name.
+- `model` is `main`, `small` or `any` (default). Use it to keep a reasoning-heavy skill off the
+  small model instead of letting it burn turns until escalation.
+
+Frontmatter is flat `key: value` only. Nested YAML is not supported.
+
+`ask --skill-new deploy-flow` writes a starter file. `ask --skills` lists what is installed,
+including anything that failed to parse and why.
+
+### How a skill gets selected
+
+Three ways, most explicit first:
+
+1. **You name it** — type `/deploy-flow ship this release` at the prompt.
+2. **Triage matches it** — alongside the routing call, the small model is asked which skill (if
+   any) covers your request. Both questions run concurrently, so this costs a round trip but
+   almost no wall-clock, and it costs zero tool-call rounds. The chosen skill is shown on the
+   status line: `qwen3.8:latest  ·  skill: deploy-flow`.
+3. **The model loads it mid-run** — the main model always sees the list of skill names and
+   descriptions and can call `load_skill` to pull one in when it decides it needs it.
+
+The two triage questions are asked in **separate calls** on purpose. Asking the small model for
+a complexity verdict and a skill name in one reply measured 4/10 on a fixture set — it answers
+one question and falls back to the first skill in the list for the other. Asked separately it
+measured 12/12.
+
+`--fast` and `--smart` skip triage entirely, so they also skip automatic skill matching; combine
+them with `/skill-name` if you want both. A flag you typed always beats a skill's `model:` field,
+which in turn beats the triage verdict.
+
+Sub-agents get no skills — no list, no `load_skill`. A delegated task has to stand alone, so the
+main model inlines whatever the helper needs into the task itself.
+
+### Why there are no project-local skills
+
+`ask` reads skills from your home directory only, never from the working directory. A skill is
+instructions that an agent with unconfirmed shell access will follow, so picking them up out of
+whatever repo you happen to `cd` into would turn cloning a repository into a code-execution path.
+
 ## Self-location
 
 Commands run in your current working directory, as before. But `ask` also knows where its
-own installed source lives (`eds_tui/main.py` inside the pipx venv), and the system prompt
+own installed source lives (the `eds_tui` package inside the pipx venv), and the system prompt
 points at it: questions about `ask` itself — its flags, options, behavior — are answered by
-reading that file, not by guessing from whatever is in the working directory.
+reading those files, not by guessing from whatever is in the working directory.
 
 Without this, asking `ask` about its own flags from inside a project containing an unrelated
 `ask.py` sent it searching the wrong program until it hit the tool-call limit.
@@ -87,7 +162,8 @@ The small model never delegates — when it owns a request it just runs commands
 ## Self-check
 
 `ask --test` exercises the whole arrangement against your live server and reports pass/fail,
-exiting nonzero if anything broke:
+exiting nonzero if anything broke. The skill checks build a throwaway fixture in a temp
+directory — they never touch your real `~/.eds_tui/skills`:
 
 ```
   eds tui self-check
@@ -101,11 +177,15 @@ exiting nonzero if anything broke:
   ✓ delegation: main spawns small     23.7s   qwen3.8:latest spawned ornith:35b ×2
   ✓ escalation past turn cap           7.9s   turn cap 1 → qwen3.8:latest after 3 turns
   ✓ bad small model falls back         0.0s   → qwen3.8:latest
+  ✓ skills: discovered and parsed      0.0s   name, description, model and body round-tripped
+  ✓ skills: triage matches a skill     1.3s   → selfcheck-widget
+  ✓ skills: load_skill returns body   18.7s   qwen3.8:latest called load_skill ×1
+  ✓ skills: /name pin vs flag          0.0s   pin → ornith:35b, --smart overrides → qwen3.8:latest
 
-  8 passed  0 failed              33.6s
+  12 passed  0 failed              49.9s
 ```
 
-The delegation and escalation checks run real agentic sessions, so their shell commands and
+The delegation, escalation and skill-loading checks run real agentic sessions, so their shell commands and
 answers print inline above the result line.
 
 ## Conversation history
