@@ -53,6 +53,32 @@ request error — the conversation is handed to the main model and continues fro
 misconfigured small model degrades to the previous single-model behavior instead of
 breaking.
 
+## Turn budget
+
+Each model gets up to 14 tool-call rounds per request. **Escalation resets that budget** —
+the main model inherits the transcript, not the rounds the small model already spent, so a
+request that escalates at round 6 does not leave the main model with 8 rounds to finish an
+investigation it just walked into.
+
+Two things keep a run from ending empty-handed:
+
+- **Repeated commands are not re-run.** If the model asks for a command it already ran this
+  session, the earlier output is replayed with a note saying so, and the round is not spent
+  on the shell. Models that have not found what they are looking for tend to reissue
+  near-identical searches; each one used to cost a round and teach nothing.
+- **Command output is clipped at ~8,000 characters**, head and tail kept, with a note
+  telling the model to narrow the search. A single unfiltered `grep -r` into a
+  `node_modules` tree returned a few hundred KB in one round, overflowed the context, and
+  failed the request outright — one bad search losing the whole run.
+- **Running out of rounds produces an answer, not an error.** At the cap, `ask` makes one
+  final call with the tools removed, so the model has to conclude from the evidence already
+  gathered and say what it could not confirm. It also gets a warning two rounds before the
+  cap, so it can usually wrap up on its own before that.
+
+The old behavior was a bare `Stopped: too many tool-call rounds.` — every command paid for,
+nothing shown, and the work to redo by hand. The information needed was almost always
+already on the transcript; what the model failed at was stopping, not finding.
+
 ## Skills
 
 A skill is a reusable procedure you write once and `ask` loads when it is relevant — how *you*
@@ -197,6 +223,9 @@ directory — they never touch your real `~/.eds_tui/skills`:
   ✓ --smart forces main model          0.0s   → qwen3.8:latest
   ✓ delegation: main spawns small     23.7s   qwen3.8:latest spawned ornith:35b ×2
   ✓ escalation past turn cap           7.9s   turn cap 1 → qwen3.8:latest after 3 turns
+  ✓ turn cap still answers            24.7s   capped at 1 round → 1298-char answer
+  ✓ repeated command is cached         0.0s   second identical command replayed, not re-executed
+  ✓ huge output is clipped             0.0s   500,000 chars → 7,735 with a note to narrow the search
   ✓ bad small model falls back         0.0s   → qwen3.8:latest
   ✓ skills: discovered and parsed      0.0s   name, description, model and body round-tripped
   ✓ skills: triage matches a skill     1.3s   → selfcheck-widget
@@ -205,7 +234,7 @@ directory — they never touch your real `~/.eds_tui/skills`:
   ✓ skills: write rejects bad input    0.0s   3 bad inputs rejected, newline folded
   ✓ skills: /name pin vs flag          0.0s   pin → ornith:35b, --smart overrides → qwen3.8:latest
 
-  14 passed  0 failed              60.0s
+  17 passed  0 failed              98.4s
 ```
 
 The delegation, escalation and skill-loading checks run real agentic sessions, so their shell commands and

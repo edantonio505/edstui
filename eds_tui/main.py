@@ -205,6 +205,17 @@ def build_system_prompt(model: str = None, skill: dict = None) -> str:
         f"- Use 'grep -r' to search inside file contents when looking for text, keywords, or strings. "
         f"- Combine both when needed. "
         f"- Suppress permission errors with '2>/dev/null'. "
+        f"- Always exclude vendored trees: --exclude-dir={{node_modules,.git,.venv,dist,build}}. "
+        f"  A recursive grep that walks node_modules returns more output than can be read "
+        f"  and wastes the round. "
+        f"Stopping discipline: you get roughly {HARD_MAX_TURNS} tool-call rounds and are "
+        f"cut off when they run out, so spend them deliberately. Put independent commands "
+        f"in one round rather than one command per round. Before each new round, check "
+        f"whether the answer is already in the output above — if it is, stop and answer. "
+        f"If two or three searches in a row have turned up nothing, that absence is itself "
+        f"the finding: report it rather than rephrasing the same search again. A partial "
+        f"answer that names what you could not confirm is far more useful than being cut "
+        f"off mid-search. "
         f"If a delegate_task tool is available to you, hand it the mechanical legwork — "
         f"gathering listings, counting things, checking status — and spend your own effort "
         f"on the reasoning and the final answer. Each delegated task must stand alone, since "
@@ -368,6 +379,27 @@ def indent_lines(text: str, indent: str) -> str:
     return "\n".join(f"{indent}{line}" for line in text.splitlines())
 
 
+# A single tool result has to fit in a 32k context alongside everything else. An
+# unbounded 'grep -r' into node_modules produced a few hundred KB in one round and
+# the request failed outright -- the whole run lost to one unfiltered search.
+MAX_OUTPUT_CHARS = 8000
+
+
+def clip_output(output: str) -> str:
+    """Keep the head and tail of a huge command output and say what was dropped."""
+    if len(output) <= MAX_OUTPUT_CHARS:
+        return output
+    head, tail = output[:6000], output[-1500:]
+    dropped = len(output) - len(head) - len(tail)
+    return (
+        f"{head}\n\n"
+        f"... [{dropped:,} characters cut. This command produced {len(output):,} characters, "
+        f"far more than can be read. Narrow it before running anything like it again: add a "
+        f"filter, use --include / --exclude-dir=node_modules, or pipe through head.] ...\n\n"
+        f"{tail}"
+    )
+
+
 def run_command(command: str, indent: str = "  ") -> str:
     label = Text()
     label.append(f"{indent}$ ", style="bold green")
@@ -386,7 +418,7 @@ def run_command(command: str, indent: str = "  ") -> str:
         output = result.stdout
         if result.stderr:
             output += result.stderr
-        output = output.strip() or "(no output)"
+        output = clip_output(output.strip()) or "(no output)"
         # Use Text to avoid Rich markup interpretation
         output_text = Text(indent_lines(output, indent), style="dim")
         console.print(output_text)
@@ -403,6 +435,36 @@ def run_command(command: str, indent: str = "  ") -> str:
         console.print(error_text)
         console.print()
         return f"Error: {e}"
+
+
+def run_command_once(command: str, seen: dict) -> str:
+    """
+    Run a command, or replay it if this exact command already ran in this loop.
+
+    A model that has not found what it is looking for tends to re-run near-identical
+    searches, and each repeat costs a round out of a hard budget. Replaying the
+    earlier output costs nothing and tells the model, in the result it is about to
+    read, that the repeat gave it nothing new.
+    """
+    command = (command or "").strip()
+    if command in seen:
+        label = Text()
+        label.append("  $ ", style="bold green")
+        label.append(command, style="bold white")
+        console.print(label)
+        console.print(Text("  (already run this session — reusing the output)",
+                           style="dim yellow"))
+        console.print()
+        return (
+            "This exact command already ran earlier in this session and returned:\n"
+            f"{seen[command]}\n\n"
+            "It was not run again. Re-running it cannot tell you anything new — try a "
+            "materially different command, or answer from what you already have."
+        )
+
+    output = run_command(command)
+    seen[command] = output
+    return output
 
 
 SUBAGENT_MAX_TURNS = 5
@@ -443,6 +505,7 @@ def delegate_task(client, task: str) -> str:
         {"role": "user", "content": task},
     ]
 
+    seen = {}
     for _ in range(SUBAGENT_MAX_TURNS):
         try:
             with Live(Spinner("dots2", text=Text(f"{SUB_INDENT}{_small_model} working...",
@@ -459,7 +522,13 @@ def delegate_task(client, task: str) -> str:
 
         if msg.tool_calls:
             for tc in msg.tool_calls:
-                output = run_command(tc.function.arguments.get("command", ""), indent=SUB_INDENT)
+                command = (tc.function.arguments.get("command", "") or "").strip()
+                if command in seen:
+                    output = (f"Already run in this subtask, output was:\n{seen[command]}\n\n"
+                              "Try something different or report what you have.")
+                else:
+                    output = run_command(command, indent=SUB_INDENT)
+                    seen[command] = output
                 messages.append({"role": "tool", "content": output})
         else:
             result = (msg.content or "").strip() or "(no result)"
@@ -470,10 +539,28 @@ def delegate_task(client, task: str) -> str:
             console.print()
             return result
 
-    return (
-        f"The subtask hit its {SUBAGENT_MAX_TURNS}-step limit without a conclusive answer. "
-        f"Handle it yourself if you still need it."
-    )
+    # Same fix as the main loop: rather than handing the parent an apology and
+    # making it redo the work, ask for a conclusion with tools removed.
+    try:
+        with Live(Spinner("dots2", text=Text(f"{SUB_INDENT}{_small_model} wrapping up...",
+                                             style="dim italic")),
+                  console=console, refresh_per_second=12, transient=True):
+            response = client.chat(
+                model=_small_model,
+                messages=messages + [{"role": "user", "content": FINAL_ANSWER_NUDGE}],
+            )
+        result = (response.message.content or "").strip()
+    except Exception:
+        result = ""
+
+    if not result:
+        return (f"The subtask hit its {SUBAGENT_MAX_TURNS}-step limit without a conclusive "
+                f"answer. Handle it yourself if you still need it.")
+
+    console.print(Text(f"{SUB_INDENT}→ {result.splitlines()[0]}", style="dim magenta"))
+    console.print()
+    return (f"(subtask hit its {SUBAGENT_MAX_TURNS}-step limit; this is its best "
+            f"conclusion from what it saw)\n{result}")
 
 
 def load_skill(name: str) -> str:
@@ -614,6 +701,70 @@ def self_upgrade():
     sys.exit(0)
 
 
+WRAP_UP_NUDGE = (
+    "SYSTEM NOTE: you have {left} tool-call round(s) left before you are cut off. "
+    "Stop widening the search. Run something only if it would change your conclusion; "
+    "otherwise answer now from what you already have, and say which parts you could "
+    "not confirm."
+)
+
+FINAL_ANSWER_NUDGE = (
+    "You have used the entire tool-call budget for this request. No further commands "
+    "will run. Answer now using only what the commands above already showed you. "
+    "State the best conclusion the evidence supports, and say plainly which parts you "
+    "could not confirm and what you would have checked next. Do not ask to run anything."
+)
+
+
+def render_answer(content: str):
+    """Print a final assistant answer in the standard panel."""
+    console.print(Panel(
+        Markdown(content or ""),
+        border_style="cyan",
+        padding=(1, 2),
+        box=box.ROUNDED,
+    ))
+    console.print()
+
+
+def final_answer(client, messages, active_model: str):
+    """
+    Make one last call with no tools attached, so the model must answer from the
+    evidence already on the transcript.
+
+    A run that hit the cap used to print 'Stopped: too many tool-call rounds' and
+    return nothing — every command paid for, no answer, and the user left to redo
+    the work by hand. The information needed is almost always already in the
+    transcript by then; what the model failed at was stopping, not finding.
+    The nudge itself is not saved to history, only the answer it produced.
+    """
+    try:
+        with Live(Spinner("dots2", text=Text("  Wrapping up...", style="dim italic")),
+                  console=console, refresh_per_second=12, transient=True):
+            response = client.chat(
+                model=active_model,
+                messages=messages + [{"role": "user", "content": FINAL_ANSWER_NUDGE}],
+            )
+    except Exception as e:
+        console.print(Text(f"  Could not produce a final answer: {e}", style="red"))
+        console.print()
+        save_history(messages)
+        return None
+
+    content = (response.message.content or "").strip()
+    if not content:
+        console.print(Text("  Stopped: too many tool-call rounds, and no answer "
+                           "could be salvaged.", style="red"))
+        console.print()
+        save_history(messages)
+        return None
+
+    messages.append(response.message)
+    render_answer(content)
+    save_history(messages)
+    return content
+
+
 def agentic_loop(client, messages, active_model: str, stats: dict = None):
     """
     Execute the agentic loop: iteratively call the LLM, process tool calls,
@@ -641,22 +792,38 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
     if stats is None:
         stats = {}
     stats.update({"turns": 0, "delegations": 0, "commands": 0, "skills_loaded": 0,
-                  "skills_created": 0, "escalated": False, "model": active_model})
+                  "skills_created": 0, "escalated": False, "capped": False,
+                  "model": active_model})
 
+    # Output of every command run this turn-loop, so an identical re-run can be
+    # answered from here instead of spending a round to learn nothing.
+    seen = {}
+
+    # 'turns' is the current model's own budget and resets on escalation; 'total'
+    # is the whole run, for the stats line. The run is still bounded -- escalation
+    # happens at most once, so the ceiling is SMALL_MAX_TURNS + HARD_MAX_TURNS.
     turns = 0
+    total = 0
     while True:
         turns += 1
-        stats["turns"] = turns
+        total += 1
+        stats["turns"] = total
         if turns > HARD_MAX_TURNS:
-            console.print("[red]  Stopped: too many tool-call rounds.[/red]\n")
-            save_history(messages)
-            return None
+            stats["capped"] = True
+            console.print(Text("  Tool-call budget spent — answering from what "
+                               "was found.", style="dim yellow"))
+            console.print()
+            return final_answer(client, messages, active_model)
 
         if active_model == _small_model and turns > SMALL_MAX_TURNS:
             console.print(Text(f"  ↑ escalating to {_model}", style="dim yellow"))
             console.print()
             active_model = _model
             stats["escalated"] = True
+            # The main model inherits the transcript, not the spent budget. Charging
+            # it for the small model's rounds left it with 8 of 14 and cut it off
+            # mid-investigation.
+            turns = 1
 
         stats["model"] = active_model
 
@@ -673,6 +840,16 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
                 active_model = _model
                 stats["escalated"] = True
                 continue
+            # The main model has nowhere to escalate to, but a request that fails
+            # mid-run used to raise a traceback and discard a transcript full of
+            # gathered evidence. Try to answer from it first; only if there is
+            # nothing to answer from does the error reach the user.
+            console.print(Text(f"  {_model} request failed ({e})", style="red"))
+            console.print()
+            if any(msg.get("role") == "tool" for msg in messages
+                   if isinstance(msg, dict)):
+                stats["capped"] = True
+                return final_answer(client, messages, active_model)
             raise
 
         msg = response.message
@@ -694,16 +871,18 @@ def agentic_loop(client, messages, active_model: str, stats: dict = None):
                     output = create_skill(args)
                 else:
                     stats["commands"] += 1
-                    output = run_command(args.get("command", ""))
+                    output = run_command_once(args.get("command", ""), seen)
                 messages.append({"role": "tool", "content": output})
+
+            # Warn before the cap rather than at it. A model that knows it has two
+            # rounds left will usually conclude; one that is cut off without notice
+            # never gets the chance. Ridden in on the last tool result because the
+            # model is certain to read that, and it creates no fake user turn.
+            left = HARD_MAX_TURNS - turns
+            if 0 < left <= 2 and messages[-1].get("role") == "tool":
+                messages[-1]["content"] += "\n\n" + WRAP_UP_NUDGE.format(left=left)
         else:
-            console.print(Panel(
-                Markdown(msg.content),
-                border_style="cyan",
-                padding=(1, 2),
-                box=box.ROUNDED,
-            ))
-            console.print()
+            render_answer(msg.content)
             save_history(messages)
             return msg.content
 
@@ -886,6 +1065,44 @@ def self_check():
         finally:
             globals()["SMALL_MAX_TURNS"] = original
 
+    def cap_still_answers():
+        """
+        The cap must produce an answer from what was gathered, never silence. This is
+        the check that would have caught a capped run returning None after spending
+        every round.
+        """
+        console.print()
+        original = HARD_MAX_TURNS
+        globals()["HARD_MAX_TURNS"] = 1
+        try:
+            messages = [{"role": "system", "content": build_system_prompt(_model)},
+                        {"role": "user", "content":
+                         "List the files in the current directory and tell me what you see."}]
+            stats = {}
+            answer = agentic_loop(client, messages, _model, stats=stats)
+            ok = bool(answer) and stats["capped"]
+            return ok, (f"capped at 1 round → {len(answer or '')}-char answer"
+                        if ok else "capped run returned no answer")
+        finally:
+            globals()["HARD_MAX_TURNS"] = original
+
+    def repeat_command_is_cached():
+        """A re-run of an identical command must not spend a round on the shell again."""
+        seen = {}
+        first = run_command_once("echo cache-probe", seen)
+        second = run_command_once("echo cache-probe", seen)
+        ok = ("cache-probe" in first
+              and "already ran earlier" in second
+              and len(seen) == 1)
+        return ok, "second identical command replayed, not re-executed"
+
+    def huge_output_is_clipped():
+        """One unfiltered grep must not be able to blow the context and kill the run."""
+        big = "x" * 500_000
+        clipped = clip_output(big)
+        ok = len(clipped) < MAX_OUTPUT_CHARS + 500 and "characters cut" in clipped
+        return ok, f"500,000 chars → {len(clipped):,} with a note to narrow the search"
+
     def bad_small_model_falls_back():
         original = _small_model
         globals()["_small_model"] = "does-not-exist:1b"
@@ -1003,6 +1220,9 @@ def self_check():
     check("--smart forces main model", smart_forces_main)
     check("delegation: main spawns small", delegation_works)
     check("escalation past turn cap", escalation_fires)
+    check("turn cap still answers", cap_still_answers)
+    check("repeated command is cached", repeat_command_is_cached)
+    check("huge output is clipped", huge_output_is_clipped)
     check("bad small model falls back", bad_small_model_falls_back)
     check("skills: discovered and parsed", skills_parse)
     check("skills: triage matches a skill", skills_triage_matches)
