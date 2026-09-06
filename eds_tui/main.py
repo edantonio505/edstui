@@ -5,7 +5,10 @@ import re
 import json
 import subprocess
 import shutil
+import ssl
 import tempfile
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import time
 import ollama
@@ -41,7 +44,53 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_ENTRY = os.path.join(APP_DIR, "main.py")
 
 
+
+# miniclosedai's dev.sh serves its own API over self-signed TLS by default
+# (https://<host>:8095) -- same trust model already used elsewhere for
+# same-box/LAN sibling services in that project (e.g. its voicestudio proxy
+# passes verify=False for the same reason). Only ever used for a same-box/
+# LAN relay call, never for the actual interdata credential.
+_INSECURE_SSL_CONTEXT = ssl._create_unverified_context()
+
+
+def _resolve_via_miniclosedai():
+    """Ask a local/LAN miniclosedai instance whether it's connected to the
+    interdata relay and, if so, which models are actually available there.
+
+    Returns (host, headers, main_model, small_model) on success. Raises on
+    any failure -- miniclosedai unreachable, interdata not connected/enabled,
+    or an empty model list -- so callers fall back to the static EDS_TUI_*
+    config below, silently and without adding latency to the common case
+    (short 2s timeout, no retries).
+    """
+    base = os.environ.get("EDS_TUI_MINICLOSEDAI_URL", "https://127.0.0.1:8095").rstrip("/")
+    mc_token = os.environ.get("EDS_TUI_MINICLOSEDAI_TOKEN", "")
+    headers = {"Authorization": f"Bearer {mc_token}"} if mc_token else {}
+    req = urllib.request.Request(f"{base}/relay/api/tags", headers=headers)
+    with urllib.request.urlopen(req, timeout=2.0, context=_INSECURE_SSL_CONTEXT) as resp:
+        data = json.loads(resp.read())
+    names = [m.get("name") for m in (data.get("models") or []) if m.get("name")]
+    if not names:
+        raise RuntimeError("miniclosedai relay reported no models")
+
+    # Prefer whatever this run is already configured to want (env override or
+    # the qwen3.8/ornith defaults); fall back to whatever interdata actually
+    # has, same preferred-else-first pattern miniclosedai's own doc-gen uses.
+    main_model = _model if _model in names else names[0]
+    remaining = [n for n in names if n != main_model]
+    small_model = _small_model if _small_model in names else (remaining[0] if remaining else main_model)
+    return f"{base}/relay/", headers, main_model, small_model
+
+
 def make_client():
+    global _model, _small_model
+    try:
+        host, headers, main_model, small_model = _resolve_via_miniclosedai()
+        _model, _small_model = main_model, small_model
+        return ollama.Client(host=host, headers=headers, timeout=None, verify=False)
+    except Exception:
+        pass  # miniclosedai not reachable, or not connected to interdata -- fall back
+
     host = os.environ.get("EDS_TUI_URL", "http://192.168.0.110:11434").rstrip("/")
     token = os.environ.get("EDS_TUI_TOKEN", "")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
