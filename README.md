@@ -23,6 +23,31 @@ export EDS_TUI_SMALL_MODEL="ornith:35b"  # optional, model for simpler requests
 
 Both models must be served from the same Ollama host and support tool calling.
 
+### Auto-connecting through miniclosedai
+
+If a [miniclosedai](https://github.com/edantonio505/miniclosedai) instance is
+reachable and it's itself connected to the interdata relay, `ask` uses that
+automatically — no config needed beyond what miniclosedai's own installer
+already writes to `~/.bash_aliases`. Each run of `ask`:
+
+1. Asks miniclosedai (`GET /relay/api/tags`, ~2s timeout) which models the
+   interdata relay currently has.
+2. If that succeeds, runs against interdata through miniclosedai's `/relay`
+   proxy — preferring `EDS_TUI_MODEL`/`EDS_TUI_SMALL_MODEL` (or their
+   `qwen3.8:latest`/`ornith:35b` defaults) if interdata actually has them,
+   else falling back to whatever models interdata does have.
+3. If miniclosedai isn't reachable, or interdata isn't connected/enabled,
+   `ask` falls straight back to `EDS_TUI_URL`/`EDS_TUI_TOKEN` above, silently
+   — no error, no behavior change.
+
+miniclosedai's own credential for interdata is never exposed to `ask` — the
+proxy injects it server-side.
+
+```bash
+export EDS_TUI_MINICLOSEDAI_URL="https://127.0.0.1:8095"   # optional, default shown
+export EDS_TUI_MINICLOSEDAI_TOKEN=""                       # optional, only if miniclosedai's API auth is enabled
+```
+
 ## Usage
 
 ```bash
